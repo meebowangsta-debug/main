@@ -47,3 +47,38 @@ If not, install it once:
 ```bash
 python -m pip install pytest
 ```
+
+
+## Financial analysis AI agent helper
+
+This repo also includes `financial_agent.py` for building a daily, high-signal research brief across:
+- AI software, AI hardware, AI infrastructure
+- Space exploration
+- Critical minerals and rare earth elements
+- Robotics
+
+Print the bootstrap workflow, source priorities (`x.com` + major financial outlets), and company watchlists:
+
+```bash
+python financial_agent.py bootstrap
+```
+
+Analyze a JSON file of observations:
+
+```bash
+python financial_agent.py analyze --input observations.json
+```
+
+Example `observations.json`:
+
+```json
+[
+  {
+    "topic": "AI hardware",
+    "company": "NVIDIA",
+    "source": "Reuters",
+    "url": "https://www.reuters.com/...",
+    "summary": "NVIDIA beats earnings and raises guidance after long-term contract win."
+  }
+]
+```
