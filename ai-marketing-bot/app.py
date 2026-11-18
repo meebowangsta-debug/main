@@ -11,6 +11,7 @@ from openai import OpenAI
 from google import genai
 from anthropic import Anthropic
 from notion_client import Client
+from customer_service import load_knowledge, service_reply, save_ticket, new_reference, DEFAULT_MODELS, test_service_connection, service_connection_error, service_error_details, cursor_reply, select_text_model
 
 
 IMAGE_MODELS = {"OpenAI": "gpt-image-1.5", "Gemini": "gemini-2.5-flash-image"}
@@ -72,6 +73,13 @@ def upload_notion_image(notion, api_key, data):
     return [{"name": "branding.png", "type": "file_upload", "file_upload": {"id": upload["id"]}}]
 
 
+def show_copyable_error(error, provider, model, api_key):
+    details = service_error_details(error, provider, model, api_key)
+    report = service_connection_error(error) + "\n\n" + json.dumps(details, ensure_ascii=False, indent=2)
+    st.caption("Copy error: click the copy icon at the top-right of the report below. | 複製錯誤：點擊下方報告右上角的複製圖示。")
+    st.code(report, language=None, wrap_lines=True)
+
+
 def test_openai_connection(api_key):
     client = OpenAI(api_key=api_key)
     client.models.list()
@@ -79,7 +87,7 @@ def test_openai_connection(api_key):
 
 def test_gemini_connection(api_key):
     client = genai.Client(api_key=api_key)
-    client.models.get(model="gemini-2.5-flash")
+    next(iter(client.models.list(config={"page_size": 1})), None)
 
 
 def test_claude_connection(api_key):
@@ -155,7 +163,7 @@ def generate_with_openai(api_key, prompt):
     client = OpenAI(api_key=api_key)
 
     response = client.responses.create(
-        model="gpt-5.2",
+        model=select_text_model("OpenAI", api_key),
         input=prompt,
         text={
             "format": {
@@ -189,7 +197,7 @@ def generate_with_gemini(api_key, prompt):
     client = genai.Client(api_key=api_key)
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=select_text_model("Gemini", api_key),
         contents=prompt
     )
 
@@ -203,7 +211,7 @@ def generate_with_claude(api_key, prompt):
     client = Anthropic(api_key=api_key)
 
     response = client.messages.create(
-        model="claude-opus-4-5",
+        model=select_text_model("Claude", api_key),
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -215,46 +223,8 @@ def generate_with_claude(api_key, prompt):
 
 
 def generate_with_cursor(api_key, prompt):
-    auth = (api_key.strip(), "")
-    max_wait_seconds = 300
-    poll_interval_seconds = 2
-
-    with httpx.Client(timeout=60.0) as client:
-        create_response = client.post(
-            f"{CURSOR_API_BASE}/v1/agents",
-            auth=auth,
-            json={
-                "prompt": {"text": prompt},
-                "model": {"id": "composer-2.5"},
-            },
-        )
-        create_response.raise_for_status()
-        created = create_response.json()
-        agent_id = created["agent"]["id"]
-        run_id = created["run"]["id"]
-
-        deadline = time.time() + max_wait_seconds
-        run_data = None
-        while time.time() < deadline:
-            run_response = client.get(
-                f"{CURSOR_API_BASE}/v1/agents/{agent_id}/runs/{run_id}",
-                auth=auth,
-            )
-            run_response.raise_for_status()
-            run_data = run_response.json()
-            status = run_data["status"]
-            if status in ("FINISHED", "ERROR", "CANCELLED", "EXPIRED"):
-                break
-            time.sleep(poll_interval_seconds)
-        else:
-            raise TimeoutError("Cursor agent run timed out")
-
-        if run_data["status"] != "FINISHED":
-            raise RuntimeError(f"Cursor run ended with status {run_data['status']}")
-
-        text = (run_data.get("result") or "").strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+    text = cursor_reply(api_key, DEFAULT_MODELS["Cursor"], [{"role": "user", "content": prompt}])
+    return json.loads(text.strip().removeprefix("```json").removesuffix("```").strip())
 
 
 NOTION_MARKETING_COPY_COLUMNS = {
@@ -509,7 +479,7 @@ def ensure_marketing_copy_database(
     if not (api_key or "").strip() or not (parent_page_id or "").strip():
         raise ValueError(
             "Notion API key and parent page link are required. | "
-            "需要 Notion 金鑰與父頁面連結。"
+            "需要 Notion 金鑰與商家頁面連結。"
         )
     test_notion_parent_page(api_key, parent_page_id)
     found = find_existing_database(
@@ -534,7 +504,7 @@ def ensure_branding_images_database(
     if not (api_key or "").strip() or not (parent_page_id or "").strip():
         raise ValueError(
             "Notion API key and parent page link are required. | "
-            "需要 Notion 金鑰與父頁面連結。"
+            "需要 Notion 金鑰與商家頁面連結。"
         )
     test_notion_parent_page(api_key, parent_page_id)
     found = find_existing_database(
@@ -736,7 +706,7 @@ st.write(
 st.markdown(
     """
     <style>
-    [data-testid="stSidebar"] :is(.st-key-ai_provider, .st-key-ai_api_key,
+    [data-testid="stSidebar"] :is(.st-key-ai_provider, [class*="st-key-ai_api_key_"],
         .st-key-notion_api_key, .st-key-notion_parent_page_id)
         [data-testid="stWidgetLabel"] p {
         color: #ffffff !important;
@@ -752,14 +722,14 @@ with st.sidebar:
 
     ai_provider = st.selectbox(
         "Choose AI Provider | 選擇 AI 供應商",
-        ["OpenAI", "Gemini", "Claude", "Cursor"],
+        ["OpenAI", "Gemini", "Grok", "Claude", "Cursor"],
         key="ai_provider",
     )
 
     ai_api_key = st.text_input(
         f"{ai_provider} API Key | {ai_provider} 金鑰",
         type="password",
-        key="ai_api_key",
+        key=f"ai_api_key_{ai_provider}",
         help=(
             "Cursor: use your key from Cursor Dashboard → Integrations. | "
             "Cursor：請在 Cursor 控制台 → Integrations 取得金鑰。"
@@ -774,24 +744,19 @@ with st.sidebar:
         else:
             with st.spinner("Testing... | 測試中..."):
                 try:
-                    if ai_provider == "OpenAI":
-                        test_openai_connection(ai_api_key)
-                    elif ai_provider == "Gemini":
-                        test_gemini_connection(ai_api_key)
-                    elif ai_provider == "Claude":
-                        test_claude_connection(ai_api_key)
-                    else:
-                        test_cursor_connection(ai_api_key)
+                    test_service_connection(ai_provider, ai_api_key.strip())
                     st.success(f"{ai_provider} connection successful! | 連線成功！")
-                except Exception as e:
-                    st.error(f"Connection failed | 連線失敗：{e}")
+                except Exception as error:
+                    st.error(service_connection_error(error))
+                    with st.expander("Connection error details | 連線錯誤詳細資訊", expanded=True):
+                        show_copyable_error(error, ai_provider, DEFAULT_MODELS[ai_provider], ai_api_key)
+                        st.caption("This test checks the API connection only. Model availability and generation credits are checked when you send a message. | 此測試僅檢查 API 連線，模型是否可用及生成額度會在傳送訊息時確認。")
 
     st.header("Notion Settings | Notion 設定")
 
     st.caption(
-        "Share one empty Notion page with your integration. "
-        "Databases are created automatically the first time you save. | "
-        "將一個空白頁分享給整合；首次按「儲存到 Notion」時會自動建立資料庫。"
+        "Use one page for business knowledge and support tickets. Connect it to your Notion integration. | "
+        "使用同一頁放商家知識與客服工單，並將頁面連接至 Notion 整合。"
     )
 
     notion_api_key = st.text_input(
@@ -801,22 +766,22 @@ with st.sidebar:
     )
 
     notion_parent_page_id = st.text_input(
-        "Parent Notion page link | Notion 父頁面連結",
+        "Notion business page link | Notion 商家頁面連結",
         placeholder="https://www.notion.so/My-page-0123456789abcdef0123456789abcdef",
         help=(
-            "Paste the link to the Notion page where your databases should be created. "
-            "In Notion, open the page and choose Copy link. Share the page with your "
-            "integration. A page ID also works. | 貼上要建立資料庫的 Notion 頁面連結。"
-            "在 Notion 開啟頁面並選擇複製連結，並將頁面分享給整合。也可填入頁面 ID。"
+            "Put your business information directly on this page. The bot reads its text and tables; "
+            "ticket databases are created or reused underneath. Subpages are not loaded automatically. | "
+            "將商家資訊直接寫在此頁面，機器人讀取文字與表格，並在頁面下建立或重用工單資料庫。子頁面不會自動載入。"
         ),
         key="notion_parent_page_id",
     )
 
-    if st.button("Test Notion page connection | 測試 Notion 頁面連線", key="btn_test_parent_page"):
+    test_notion_clicked = st.button("Test Notion page connection | 測試 Notion 頁面連線", key="btn_test_parent_page")
+    if test_notion_clicked:
         if not notion_api_key.strip() or not notion_parent_page_id.strip():
             st.warning(
-                "Enter your Notion API key and paste the parent page link first. | "
-                "請先輸入 Notion 金鑰並貼上父頁面連結。"
+                "Enter your Notion API key and paste the business page link first. | "
+                "請先輸入 Notion 金鑰並貼上商家頁面連結。"
             )
         else:
             with st.spinner("Testing page connection... | 測試頁面連線中..."):
@@ -834,6 +799,54 @@ with st.sidebar:
                         "無法連線至 Notion 頁面。請檢查金鑰與頁面連結，並將頁面分享給整合。"
                     )
                     st.caption(str(e))
+
+    with st.expander("Advanced: separate knowledge page | 進階：使用不同知識頁面"):
+        separate_knowledge = st.checkbox("Use a different knowledge page | 使用不同的知識頁面", key="use_separate_knowledge")
+        separate_link = st.text_input(
+            "Separate knowledge page link | 另一個知識頁面連結",
+            key="service_knowledge_link", disabled=not separate_knowledge,
+            help="Connect this page to the same Notion integration. | 請將此頁面連接至相同的 Notion 整合。",
+        )
+    knowledge_link = separate_link if separate_knowledge else notion_parent_page_id
+    scope = (parse_notion_id(knowledge_link), parse_notion_id(notion_parent_page_id), notion_api_key)
+    if st.session_state.get("service_scope") != scope:
+        for state_key in list(st.session_state):
+            if state_key.startswith("support_"):
+                del st.session_state[state_key]
+        st.session_state.service_scope = scope
+        st.session_state.service_knowledge_attempted = False
+        st.session_state.service_knowledge_error = False
+        st.session_state.pop("service_knowledge_details", None)
+    st.session_state.setdefault("support_messages", [])
+    refresh_knowledge = st.button("Refresh business knowledge | 更新商家知識", key="btn_load_knowledge")
+    auto_load_knowledge = (
+        bool(notion_api_key.strip() and knowledge_link.strip())
+        and not st.session_state.get("support_knowledge")
+        and (not st.session_state.get("service_knowledge_error") or test_notion_clicked)
+    )
+    if refresh_knowledge or auto_load_knowledge:
+        # Clear stale knowledge and chat before attempting refresh.
+        for state_key in list(st.session_state):
+            if state_key.startswith("support_"):
+                del st.session_state[state_key]
+        st.session_state.support_messages = []
+        if not notion_api_key.strip() or not knowledge_link.strip():
+            st.warning("Enter the Notion key and business page link. | 請輸入 Notion 金鑰與商家頁面連結。")
+        else:
+            st.session_state.service_knowledge_attempted = True
+            st.session_state.service_knowledge_error = False
+            try:
+                with st.spinner("Loading knowledge... | 正在載入知識..."):
+                    st.session_state.support_knowledge = load_knowledge(notion_api_key.strip(), parse_notion_id(knowledge_link))
+            except Exception as error:
+                st.session_state.service_knowledge_error = True
+                st.session_state.service_knowledge_details = service_error_details(
+                    error, "Notion", "Business page text", notion_api_key
+                )
+    if st.session_state.get("service_knowledge_error"):
+        st.error("Knowledge could not be loaded. Check the Notion key, page access, and readable page text, then click Refresh business knowledge to retry. | 無法載入知識，請檢查 Notion 金鑰、頁面權限與文字內容，再按「更新商家知識」重試。")
+    if st.session_state.get("support_knowledge"):
+        st.caption("Business knowledge loaded | 商家知識已載入：" + st.session_state.support_knowledge["title"])
 
     notion_column_language = st.selectbox(
         "Notion column names | Notion 欄位名稱",
@@ -869,8 +882,8 @@ with st.sidebar:
         st.session_state.branding_images_database_id = branding_db_input.strip()
 
 
-tab_copy, tab_branding = st.tabs(
-    ["Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片"]
+tab_copy, tab_branding, tab_service = st.tabs(
+    ["Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片", "Customer Service | 顧客服務"]
 )
 
 with tab_copy:
@@ -952,6 +965,11 @@ with tab_copy:
                         st.session_state.output = generate_with_openai(ai_api_key, prompt)
                     elif ai_provider == "Gemini":
                         st.session_state.output = generate_with_gemini(ai_api_key, prompt)
+                    elif ai_provider == "Grok":
+                        response = OpenAI(api_key=ai_api_key.strip(), base_url="https://api.x.ai/v1").responses.create(
+                            model=select_text_model("Grok", ai_api_key.strip()), input=prompt, store=False
+                        )
+                        st.session_state.output = json.loads(response.output_text.strip().removeprefix("```json").removesuffix("```").strip())
                     elif ai_provider == "Claude":
                         st.session_state.output = generate_with_claude(ai_api_key, prompt)
                     else:
@@ -991,8 +1009,8 @@ with tab_copy:
                 )
             elif not notion_parent_page_id and not st.session_state.marketing_copy_database_id:
                 st.error(
-                    "Paste a parent Notion page link (first save) or enter an existing database ID. | "
-                    "首次儲存請貼上 Notion 父頁面連結，或填入既有資料庫 ID。"
+                    "Paste a Notion business page link (first save) or enter an existing database ID. | "
+                    "首次儲存請貼上 Notion 商家頁面連結，或填入既有資料庫 ID。"
                 )
             else:
                 with st.spinner(
@@ -1258,8 +1276,8 @@ with tab_branding:
             )
         elif not notion_parent_page_id and not st.session_state.branding_images_database_id:
             st.error(
-                "Paste a parent Notion page link (first save) or enter an existing database ID. | "
-                "首次儲存請貼上 Notion 父頁面連結，或填入既有資料庫 ID。"
+                "Paste a Notion business page link (first save) or enter an existing database ID. | "
+                "首次儲存請貼上 Notion 商家頁面連結，或填入既有資料庫 ID。"
             )
         else:
             overlay = overlay_language if include_text_on_image else ""
@@ -1337,3 +1355,102 @@ with tab_branding:
                 except Exception as e:
                     st.error("Something went wrong while saving to Notion. | 儲存到 Notion 時發生錯誤。")
                     st.code(str(e))
+
+with tab_service:
+    st.header("Customer Service | 顧客服務")
+    st.caption("Answers use your loaded business reference. Review and confirm before any ticket is saved. | 回覆依據已載入的商家資料；工單須確認後才儲存。")
+    service_provider = ai_provider
+    service_key = ai_api_key.strip()
+    service_model = DEFAULT_MODELS[service_provider]
+    st.caption(f"Using {service_provider} from the sidebar. | 使用側欄設定的 {service_provider}。")
+    if service_provider == "Cursor":
+        st.caption("Uses Cursor Cloud Agents; replies may take longer. | 使用 Cursor 雲端代理，回覆可能較慢。")
+    knowledge = st.session_state.get("support_knowledge")
+    if not knowledge:
+        if st.session_state.get("service_knowledge_error"):
+            st.error("The page may be connected, but its business reference could not be loaded. Chat needs readable text directly on the knowledge page. | 頁面可能已連線，但無法載入商家參考資料。聊天需要知識頁面上的可讀文字。")
+            details = st.session_state.get("service_knowledge_details")
+            if details:
+                with st.expander("Knowledge loading error | 知識載入錯誤", expanded=True):
+                    st.caption("Copy the report using its top-right copy icon. | 使用報告右上角圖示複製錯誤。")
+                    st.code(json.dumps(details, ensure_ascii=False, indent=2), language=None, wrap_lines=True)
+            if st.button("Retry loading business reference | 重新載入商家資料", key="retry_service_knowledge"):
+                st.session_state.service_knowledge_error = False
+                st.rerun()
+        elif separate_knowledge and not knowledge_link.strip():
+            st.warning("Enter the separate knowledge page link under Advanced, or turn off that option to use your business page. | 請在進階設定填入另一個知識頁面連結，或取消此選項以使用商家頁面。")
+        else:
+            st.info("Enter your Notion key and business page link in the sidebar to load the reference automatically. | 在側欄填入 Notion 金鑰與商家頁面連結，即可自動載入參考資料。")
+    elif not service_key:
+        st.info("Business reference is ready. Enter your AI API key in the sidebar to start chatting. | 商家資料已就緒，請在側欄輸入 AI 金鑰以開始對話。")
+    if knowledge:
+        st.success("Knowledge loaded | 已載入知識：" + knowledge["title"])
+        st.link_button("Open business reference | 開啟商家資料", knowledge["url"])
+        with st.expander("Loaded reference | 已載入的參考資料"):
+            st.text(knowledge["text"])
+    if st.button("New conversation | 新對話"):
+        for state_key in list(st.session_state):
+            if state_key.startswith("support_") and state_key != "support_knowledge":
+                del st.session_state[state_key]
+        st.session_state.support_messages = []
+        st.rerun()
+    for message in st.session_state.support_messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    message = st.chat_input("Ask about this business | 詢問商家資訊", disabled=not knowledge or not service_key.strip())
+    if message:
+        if len(message) > 4000 or sum(len(m["content"]) for m in st.session_state.support_messages) + len(message) > 40000:
+            st.warning("Conversation is too long. Shorten your message or start a new conversation. | 對話過長，請縮短訊息或開始新對話。")
+        else:
+            history = st.session_state.support_messages + [{"role": "user", "content": message}]
+            try:
+                with st.spinner(f"{service_provider} is replying... | {service_provider} 回覆中..."):
+                    answer = service_reply(service_provider, service_key, service_model.strip(), knowledge, history)
+                st.session_state.support_messages = history + [{"role": "assistant", "content": answer}]
+                st.rerun()
+            except Exception as error:
+                st.error(service_connection_error(error))
+                with st.expander("Reply error details | 回覆錯誤詳細資訊", expanded=True):
+                    show_copyable_error(error, service_provider, service_model, service_key)
+    if st.button("Create support ticket | 建立客服工單", disabled=not knowledge or not service_key.strip() or not st.session_state.support_messages):
+        try:
+            with st.spinner("Preparing ticket draft... | 正在準備工單草稿..."):
+                draft = service_reply(service_provider, service_key, service_model.strip(), knowledge, st.session_state.support_messages, draft=True)
+            for field, value in draft.items():
+                st.session_state["support_field_" + field] = value
+            st.session_state.support_draft = draft
+            st.session_state.support_ticket_history = list(st.session_state.support_messages)
+            st.session_state.support_reference = new_reference()
+            st.session_state.pop("support_saved", None)
+        except Exception as error:
+            st.error(service_connection_error(error))
+            with st.expander("Ticket draft error details | 工單草稿錯誤詳細資訊", expanded=True):
+                show_copyable_error(error, service_provider, service_model, service_key)
+    if st.session_state.get("support_draft") and not st.session_state.get("support_saved"):
+        st.subheader("Review ticket | 檢查工單")
+        st.caption("Only explicitly confirmed tickets are saved. Staff notifications are not configured. | 僅儲存確認的工單；尚未設定通知人員。")
+        with st.form("support_review"):
+            subject = st.text_input("Subject | 主旨", key="support_field_subject", max_chars=200)
+            name = st.text_input("Name (optional) | 姓名（選填）", key="support_field_name", max_chars=200)
+            contact = st.text_input("Contact (optional) | 聯絡方式（選填）", key="support_field_contact", max_chars=500)
+            category = st.text_input("Category | 類別", key="support_field_category", max_chars=200)
+            summary = st.text_area("Issue summary | 問題摘要", key="support_field_summary", max_chars=5000)
+            include_history = st.checkbox("Include conversation in ticket | 工單附上對話紀錄")
+            confirmed = st.form_submit_button("Confirm and create support ticket | 確認並建立客服工單")
+        if confirmed:
+            if not subject.strip() or not summary.strip() or not notion_api_key.strip() or not notion_parent_page_id.strip():
+                st.error("Subject, summary, Notion key and business page link are required. | 請填寫主旨、摘要、Notion 金鑰與商家頁面連結。")
+            else:
+                try:
+                    with st.spinner("Saving ticket... | 正在儲存工單..."):
+                        result = save_ticket(notion_api_key, parse_notion_id(notion_parent_page_id), notion_column_language,
+                            {"subject": subject, "name": name, "contact": contact, "category": category, "summary": summary},
+                            st.session_state.support_ticket_history, include_history, st.session_state.support_reference,
+                            prepare_notion_data_source)
+                    st.session_state.support_saved = result.get("url") or "https://www.notion.so/" + result["id"].replace("-", "")
+                    st.rerun()
+                except Exception:
+                    st.error("Ticket save could not be confirmed. Check Notion access and retry; the same ticket reference will be reused. | 無法確認工單儲存結果，請檢查 Notion 權限後重試，將沿用相同工單編號。")
+    if st.session_state.get("support_saved"):
+        st.success("Support ticket saved | 客服工單已儲存：" + st.session_state.support_reference)
+        st.link_button("Open ticket in Notion | 在 Notion 開啟工單", st.session_state.support_saved)
