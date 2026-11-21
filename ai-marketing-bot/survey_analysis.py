@@ -763,15 +763,33 @@ def render_survey_analysis(provider, ai_key):
             "Recommendation / 建議":e["text"], "What to measure / 應追蹤指標":e.get("success_measure", "")}
             for i,e in enumerate(ai_saved["insights"]["recommendations"],1)], hide_index=True, width="stretch")
         if ai_saved["insights"]["recommendations"]:
+            st.markdown("""
+                <style>
+                .st-key-survey_to_promotion button {
+                    background-color: #c62828 !important;
+                    color: #ffffff !important;
+                    border: 2px solid #ef5350 !important;
+                    min-height: 4rem;
+                    padding: 0.9rem 1.2rem;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 12px rgba(198, 40, 40, 0.3);
+                }
+                .st-key-survey_to_promotion button p {
+                    color: #ffffff !important;
+                    font-weight: 700;
+                    font-size: 1.05rem;
+                }
+                .st-key-survey_to_promotion button:hover {
+                    background-color: #a51c1c !important;
+                }
+                .st-key-survey_to_promotion button:focus-visible {
+                    outline: 3px solid #ffb4b4;
+                    outline-offset: 3px;
+                }
+                </style>
+            """, unsafe_allow_html=True)
             st.button("Use recommendations in Marketing Promotion | 將建議用於行銷推廣", key="survey_to_promotion",
-                on_click=use_recommendations, args=(recommendation_brief(ai_saved,filename),))
-        with st.expander("Full evidence and sample coverage | 完整依據與樣本涵蓋範圍"):
-            for section in ("interpretations","themes","recommendations"):
-                for entry in ai_saved["insights"][section]:
-                    st.markdown(prose(entry.get("title") or entry["text"]))
-                    for note in evidence_notes(ai_saved["payload"],entry.get("evidence_ids",entry.get("response_ids",[]))):
-                        st.caption(prose(note))
-            st.json(ai_saved["payload"]["feedback_coverage"])
+                type="primary", width="stretch", on_click=use_recommendations, args=(recommendation_brief(ai_saved,filename),))
     st.subheader("Download analysis and charts | 下載分析與圖表")
     metadata = {"file": filename, "worksheet": sheet, "responses": len(frame), **notes,
         "method": "One nonblank row = one response; duplicate rows retained. Counts are unweighted, descriptive, not population estimates."}
