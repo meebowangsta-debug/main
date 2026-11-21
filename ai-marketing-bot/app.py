@@ -11,6 +11,8 @@ from openai import OpenAI
 from google import genai
 from anthropic import Anthropic
 from notion_client import Client
+from survey_analysis import render_survey_analysis
+from marketing_plan import render_marketing_plan, COPY_WORKFLOW, PLAN_WORKFLOW
 from customer_service import load_knowledge, service_reply, save_ticket, new_reference, DEFAULT_MODELS, test_service_connection, service_connection_error, service_error_details, cursor_reply, select_text_model
 
 
@@ -882,178 +884,186 @@ with st.sidebar:
         st.session_state.branding_images_database_id = branding_db_input.strip()
 
 
-tab_copy, tab_branding, tab_service = st.tabs(
-    ["Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片", "Customer Service | 顧客服務"]
+selected_module = st.selectbox(
+    "Choose a module | 選擇模組",
+    ["Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片", "Customer Service | 顧客服務", "Survey Results Analysis | 問卷結果分析"],
+    key="selected_module",
 )
 
-with tab_copy:
-    st.header("Promotion Inputs | 推廣資訊")
-
-    product_name = st.text_input(
-        "Product Name | 產品名稱",
-        placeholder="e.g. Matcha Latte | 例：抹茶拿鐵",
-        key="copy_product_name",
+if selected_module == "Marketing promotion | 行銷推廣":
+    marketing_workflow = st.selectbox(
+        "Promotion workflow | 推廣工作流程", [COPY_WORKFLOW, PLAN_WORKFLOW], key="marketing_workflow"
     )
+    if marketing_workflow == PLAN_WORKFLOW:
+        render_marketing_plan(ai_provider, ai_api_key, notion_api_key, notion_parent_page_id, parse_notion_id)
+    else:
+        st.header("Promotion Inputs | 推廣資訊")
 
-    product_description = st.text_area(
-        "Product Description | 產品描述",
-        placeholder=(
-            "e.g. A smooth Japanese-style matcha latte made with fresh milk. | "
-            "例：一款用新鮮牛奶製作的日式抹茶拿鐵。"
-        ),
-        key="copy_product_description",
-    )
+        product_name = st.text_input(
+            "Product Name | 產品名稱",
+            placeholder="e.g. Matcha Latte | 例：抹茶拿鐵",
+            key="copy_product_name",
+        )
 
-    promotion_type = st.selectbox(
-        "Promotion Type | 推廣類型",
-        [
-            "Buy One Get One Free | 買一送一",
-            "Discount | 折扣",
-            "Limited-Time Offer | 限時優惠",
-            "Free Gift | 贈品",
-            "Student Special | 學生優惠",
-            "New Product Launch | 新品發布",
-        ],
-        key="copy_promotion_type",
-    )
+        product_description = st.text_area(
+            "Product Description | 產品描述",
+            placeholder=(
+                "e.g. A smooth Japanese-style matcha latte made with fresh milk. | "
+                "例：一款用新鮮牛奶製作的日式抹茶拿鐵。"
+            ),
+            key="copy_product_description",
+        )
 
-    target_audience = st.text_input(
-        "Target Audience | 目標受眾",
-        placeholder="e.g. College students | 例：大學生",
-        key="copy_target_audience",
-    )
+        promotion_type = st.selectbox(
+            "Promotion Type | 推廣類型",
+            [
+                "Buy One Get One Free | 買一送一",
+                "Discount | 折扣",
+                "Limited-Time Offer | 限時優惠",
+                "Free Gift | 贈品",
+                "Student Special | 學生優惠",
+                "New Product Launch | 新品發布",
+            ],
+            key="copy_promotion_type",
+        )
 
-    message_tone = st.selectbox(
-        "Message Tone | 文案風格",
-        [
-            "Fun | 有趣",
-            "Professional | 專業",
-            "Exciting | 興奮",
-            "Cute | 可愛",
-            "Luxury | 高端",
-            "Friendly | 親切",
-            "Urgent | 緊迫",
-        ],
-        key="copy_message_tone",
-    )
+        target_audience = st.text_input(
+            "Target Audience | 目標受眾",
+            placeholder="e.g. College students | 例：大學生",
+            key="copy_target_audience",
+        )
 
-    time_frame = st.text_input(
-        "Time Frame of Promotion | 推廣時間段",
-        placeholder="e.g. Monday to Friday this week | 例：本週一至週五",
-        key="copy_time_frame",
-    )
+        message_tone = st.selectbox(
+            "Message Tone | 文案風格",
+            [
+                "Fun | 有趣",
+                "Professional | 專業",
+                "Exciting | 興奮",
+                "Cute | 可愛",
+                "Luxury | 高端",
+                "Friendly | 親切",
+                "Urgent | 緊迫",
+            ],
+            key="copy_message_tone",
+        )
 
-    if "output" not in st.session_state:
-        st.session_state.output = None
+        time_frame = st.text_input(
+            "Time Frame of Promotion | 推廣時間段",
+            placeholder="e.g. Monday to Friday this week | 例：本週一至週五",
+            key="copy_time_frame",
+        )
 
-    if st.button("Generate Marketing Content | 產生行銷內容", key="btn_generate_copy"):
-        if not ai_api_key:
-            st.error(f"Please enter your {ai_provider} API key. | 請輸入 {ai_provider} 金鑰。")
-        else:
-            prompt = build_prompt(
-                product_name,
-                product_description,
-                promotion_type,
-                target_audience,
-                message_tone,
-                time_frame
-            )
+        if "output" not in st.session_state:
+            st.session_state.output = None
 
-            with st.spinner(f"{ai_provider} is generating content... | 正在產生內容..."):
-                try:
-                    if ai_provider == "OpenAI":
-                        st.session_state.output = generate_with_openai(ai_api_key, prompt)
-                    elif ai_provider == "Gemini":
-                        st.session_state.output = generate_with_gemini(ai_api_key, prompt)
-                    elif ai_provider == "Grok":
-                        response = OpenAI(api_key=ai_api_key.strip(), base_url="https://api.x.ai/v1").responses.create(
-                            model=select_text_model("Grok", ai_api_key.strip()), input=prompt, store=False
-                        )
-                        st.session_state.output = json.loads(response.output_text.strip().removeprefix("```json").removesuffix("```").strip())
-                    elif ai_provider == "Claude":
-                        st.session_state.output = generate_with_claude(ai_api_key, prompt)
-                    else:
-                        st.session_state.output = generate_with_cursor(ai_api_key, prompt)
-
-                    st.success("Marketing content generated! | 行銷內容已產生！")
-
-                except Exception as e:
-                    st.error("Something went wrong while generating content. | 產生內容時發生錯誤。")
-                    st.code(str(e))
-
-    if st.session_state.output:
-        output = st.session_state.output
-
-        st.header("AI Marketing Outputs | AI 行銷內容")
-
-        st.subheader("IG Caption | Instagram 文案")
-        st.write(output["ig_caption"])
-
-        st.subheader("TikTok Script | TikTok 腳本")
-        st.write(output["tiktok_script"])
-
-        st.subheader("Hashtags | 話題標籤")
-        st.write(output["hashtags"])
-
-        st.subheader("Brief Email Content | 郵件內容")
-        st.write(output["brief_email_content"])
-
-        st.subheader("Raw JSON")
-        st.json(output)
-
-        if st.button("Save Output to Notion | 儲存到 Notion", key="btn_save_copy"):
-            if not notion_api_key:
-                st.error(
-                    "Enter your Notion API key in the sidebar. | "
-                    "請在側欄輸入 Notion 金鑰。"
-                )
-            elif not notion_parent_page_id and not st.session_state.marketing_copy_database_id:
-                st.error(
-                    "Paste a Notion business page link (first save) or enter an existing database ID. | "
-                    "首次儲存請貼上 Notion 商家頁面連結，或填入既有資料庫 ID。"
-                )
+        if st.button("Generate Marketing Content | 產生行銷內容", key="btn_generate_copy"):
+            if not ai_api_key:
+                st.error(f"Please enter your {ai_provider} API key. | 請輸入 {ai_provider} 金鑰。")
             else:
-                with st.spinner(
-                    "Saving to Notion... | 正在儲存到 Notion（必要時會建立資料庫）..."
-                ):
+                prompt = build_prompt(
+                    product_name,
+                    product_description,
+                    promotion_type,
+                    target_audience,
+                    message_tone,
+                    time_frame
+                )
+
+                with st.spinner(f"{ai_provider} is generating content... | 正在產生內容..."):
                     try:
-                        db_id, created_db = ensure_marketing_copy_database(
-                            notion_api_key,
-                            notion_parent_page_id,
-                            notion_column_language,
-                            st.session_state.marketing_copy_database_id,
-                        )
-                        st.session_state.marketing_copy_database_id = db_id
-                        save_to_notion(
-                            notion_api_key,
-                            db_id,
-                            notion_column_language,
-                            ai_provider,
-                            product_name,
-                            product_description,
-                            promotion_type,
-                            target_audience,
-                            message_tone,
-                            time_frame,
-                            output,
-                        )
-                        if created_db:
-                            st.success(
-                                "Created marketing database and saved your row! | "
-                                "已建立文案資料庫並儲存內容！"
+                        if ai_provider == "OpenAI":
+                            st.session_state.output = generate_with_openai(ai_api_key, prompt)
+                        elif ai_provider == "Gemini":
+                            st.session_state.output = generate_with_gemini(ai_api_key, prompt)
+                        elif ai_provider == "Grok":
+                            response = OpenAI(api_key=ai_api_key.strip(), base_url="https://api.x.ai/v1").responses.create(
+                                model=select_text_model("Grok", ai_api_key.strip()), input=prompt, store=False
                             )
-                            show_created_database_details(
-                                db_id, notion_column_language, "marketing_copy"
-                            )
+                            st.session_state.output = json.loads(response.output_text.strip().removeprefix("```json").removesuffix("```").strip())
+                        elif ai_provider == "Claude":
+                            st.session_state.output = generate_with_claude(ai_api_key, prompt)
                         else:
-                            st.success("Saved to Notion database! | 已儲存到 Notion 資料庫！")
-                            show_notion_database_link(db_id)
+                            st.session_state.output = generate_with_cursor(ai_api_key, prompt)
+
+                        st.success("Marketing content generated! | 行銷內容已產生！")
 
                     except Exception as e:
-                        st.error("Something went wrong while saving to Notion. | 儲存到 Notion 時發生錯誤。")
+                        st.error("Something went wrong while generating content. | 產生內容時發生錯誤。")
                         st.code(str(e))
 
-with tab_branding:
+        if st.session_state.output:
+            output = st.session_state.output
+
+            st.header("AI Marketing Outputs | AI 行銷內容")
+
+            st.subheader("IG Caption | Instagram 文案")
+            st.write(output["ig_caption"])
+
+            st.subheader("TikTok Script | TikTok 腳本")
+            st.write(output["tiktok_script"])
+
+            st.subheader("Hashtags | 話題標籤")
+            st.write(output["hashtags"])
+
+            st.subheader("Brief Email Content | 郵件內容")
+            st.write(output["brief_email_content"])
+
+            st.subheader("Raw JSON")
+            st.json(output)
+
+            if st.button("Save Output to Notion | 儲存到 Notion", key="btn_save_copy"):
+                if not notion_api_key:
+                    st.error(
+                        "Enter your Notion API key in the sidebar. | "
+                        "請在側欄輸入 Notion 金鑰。"
+                    )
+                elif not notion_parent_page_id and not st.session_state.marketing_copy_database_id:
+                    st.error(
+                        "Paste a Notion business page link (first save) or enter an existing database ID. | "
+                        "首次儲存請貼上 Notion 商家頁面連結，或填入既有資料庫 ID。"
+                    )
+                else:
+                    with st.spinner(
+                        "Saving to Notion... | 正在儲存到 Notion（必要時會建立資料庫）..."
+                    ):
+                        try:
+                            db_id, created_db = ensure_marketing_copy_database(
+                                notion_api_key,
+                                notion_parent_page_id,
+                                notion_column_language,
+                                st.session_state.marketing_copy_database_id,
+                            )
+                            st.session_state.marketing_copy_database_id = db_id
+                            save_to_notion(
+                                notion_api_key,
+                                db_id,
+                                notion_column_language,
+                                ai_provider,
+                                product_name,
+                                product_description,
+                                promotion_type,
+                                target_audience,
+                                message_tone,
+                                time_frame,
+                                output,
+                            )
+                            if created_db:
+                                st.success(
+                                    "Created marketing database and saved your row! | "
+                                    "已建立文案資料庫並儲存內容！"
+                                )
+                                show_created_database_details(
+                                    db_id, notion_column_language, "marketing_copy"
+                                )
+                            else:
+                                st.success("Saved to Notion database! | 已儲存到 Notion 資料庫！")
+                                show_notion_database_link(db_id)
+
+                        except Exception as e:
+                            st.error("Something went wrong while saving to Notion. | 儲存到 Notion 時發生錯誤。")
+                            st.code(str(e))
+
+elif selected_module == "Branding & image | 品牌與圖片":
     st.header("Branding & Image Inputs | 品牌與圖片資訊")
 
     st.subheader("Business & product | 業態與產品")
@@ -1356,7 +1366,7 @@ with tab_branding:
                     st.error("Something went wrong while saving to Notion. | 儲存到 Notion 時發生錯誤。")
                     st.code(str(e))
 
-with tab_service:
+elif selected_module == "Customer Service | 顧客服務":
     st.header("Customer Service | 顧客服務")
     st.caption("Answers use your loaded business reference. Review and confirm before any ticket is saved. | 回覆依據已載入的商家資料；工單須確認後才儲存。")
     service_provider = ai_provider
@@ -1454,3 +1464,7 @@ with tab_service:
     if st.session_state.get("support_saved"):
         st.success("Support ticket saved | 客服工單已儲存：" + st.session_state.support_reference)
         st.link_button("Open ticket in Notion | 在 Notion 開啟工單", st.session_state.support_saved)
+
+
+elif selected_module == "Survey Results Analysis | 問卷結果分析":
+    render_survey_analysis(ai_provider, ai_api_key)

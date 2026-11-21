@@ -291,9 +291,36 @@ def customer_reply_language(history):
     return "Traditional Chinese" if chinese and chinese >= english_words else "English"
 
 
+def generate_ai_text(provider, key, instruction, messages, max_tokens=2048):
+    """Shared text generation for customer service and survey design."""
+    model = select_text_model(provider, key) if provider != "Cursor" else "auto"
+    if provider in {"Grok", "OpenAI"}:
+        options = {"base_url": "https://api.x.ai/v1"} if provider == "Grok" else {}
+        client = OpenAI(api_key=key, timeout=90.0, max_retries=0, **options)
+        response = client.responses.create(model=model, store=False, input=messages)
+        text = response.output_text.strip()
+    elif provider == "Gemini":
+        contents = [{"role": "model" if m["role"] == "assistant" else "user",
+                     "parts": [{"text": m["content"]}]} for m in messages[1:]]
+        with genai.Client(api_key=key, http_options={"timeout": 90000}) as client:
+            response = client.models.generate_content(model=model, contents=contents,
+                config={"system_instruction": instruction})
+        text = (response.text or "").strip()
+    elif provider == "Claude":
+        response = Anthropic(api_key=key, timeout=90, max_retries=0).messages.create(
+            model=model, max_tokens=max_tokens, system=instruction, messages=messages[1:]
+        )
+        text = "".join(part.text for part in response.content if part.type == "text").strip()
+    elif provider == "Cursor":
+        text = cursor_reply(key, model, messages).strip()
+    else:
+        raise ValueError("Unsupported customer-service provider.")
+    if not text:
+        raise ValueError("The provider returned no text. Please retry.")
+    return text
+
+
 def service_reply(provider, key, model, knowledge, history, draft=False):
-    if provider != "Cursor":
-        model = select_text_model(provider, key)
     instruction = (
         "You are a business customer-service assistant. Reply in the customer's language, including Traditional Chinese. "
         "Use only the business reference for business facts. Never invent prices, opening hours, promotions, refund policies, "
@@ -324,29 +351,7 @@ def service_reply(provider, key, model, knowledge, history, draft=False):
             'Do not ask follow-up questions. Leave unknown customer details empty. '
             'Do not create or save anything; the customer will review this draft.'
         )})
-    if provider in {"Grok", "OpenAI"}:
-        options = {"base_url": "https://api.x.ai/v1"} if provider == "Grok" else {}
-        client = OpenAI(api_key=key, timeout=90.0, max_retries=0, **options)
-        response = client.responses.create(model=model, store=False, input=messages)
-        text = response.output_text.strip()
-    elif provider == "Gemini":
-        contents = [{"role": "model" if m["role"] == "assistant" else "user",
-                     "parts": [{"text": m["content"]}]} for m in messages[1:]]
-        with genai.Client(api_key=key, http_options={"timeout": 90000}) as client:
-            response = client.models.generate_content(model=model, contents=contents,
-                config={"system_instruction": instruction})
-        text = (response.text or "").strip()
-    elif provider == "Claude":
-        response = Anthropic(api_key=key, timeout=90, max_retries=0).messages.create(
-            model=model, max_tokens=2048, system=instruction, messages=messages[1:]
-        )
-        text = "".join(part.text for part in response.content if part.type == "text").strip()
-    elif provider == "Cursor":
-        text = cursor_reply(key, model, messages).strip()
-    else:
-        raise ValueError("Unsupported customer-service provider.")
-    if not text:
-        raise ValueError("The provider returned no text. Please retry.")
+    text = generate_ai_text(provider, key, instruction, messages)
     if not draft:
         return text
     return parse_ticket_draft(text)
