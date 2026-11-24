@@ -6,10 +6,17 @@ import httpx
 from google import genai
 from datetime import datetime, timezone
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from notion_client import Client
 from openai import OpenAI
 from anthropic import Anthropic
+
+
+def dated_notion_title(title, when=None):
+    moment=(when or datetime.now(ZoneInfo("Asia/Taipei"))).astimezone(ZoneInfo("Asia/Taipei"))
+    stamp=moment.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return (str(title or "").strip() or "Untitled / 未命名")[:1800]+" · "+stamp+" UTC+08"
 
 TITLES = {"English": "AI Support Tickets", "Traditional Chinese | 繁體中文": "AI 客服工單"}
 FIELDS = {
@@ -432,7 +439,7 @@ def save_ticket(key, parent_id, language, draft, history, include_history, refer
     props = {}
     for label, kind, value in zip(labels, types, values):
         if kind == "title":
-            props[label] = {"title": rich(value[:2000])}
+            props[label] = {"title": rich(dated_notion_title(value))}
         elif kind == "date":
             props[label] = {"date": {"start": datetime.now(timezone.utc).isoformat()}}
         else:

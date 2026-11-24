@@ -411,7 +411,7 @@ class InsightValidationError(ValueError):
     """An invalid model output, separate from a provider/connection failure."""
 
 
-def validate_insights(raw, payload):
+def validate_insights(raw, payload, *, omit_invalid_themes=False):
     decoder = json.JSONDecoder()
     parsed = None
     for match in re.finditer(r"\{", raw):
@@ -424,6 +424,17 @@ def validate_insights(raw, payload):
             pass
     if not isinstance(parsed, dict):
         raise InsightValidationError("AI returned an unreadable analysis. | AI 分析格式無法讀取。")
+    omitted_themes = 0
+    if omit_invalid_themes and isinstance(parsed["themes"],list) and len(parsed["themes"])<=6:
+        retained=[]
+        for entry in parsed["themes"]:
+            try:
+                # Validate each theme normally; never infer or manufacture references.
+                validate_insights(json.dumps({"interpretations":[],"themes":[entry],"recommendations":[]}),payload)
+                retained.append(entry)
+            except InsightValidationError:
+                omitted_themes+=1
+        parsed["themes"]=retained
     facts = {r["id"] for r in payload["measured_findings"]}
     feedback = {r["id"]: r for r in payload["feedback"]}
     output = {}
@@ -441,7 +452,7 @@ def validate_insights(raw, payload):
             if len(entry["text"]) > 700:
                 raise InsightValidationError(f"{location}: shorten text to 700 characters or fewer. | 請精簡文字。")
             ids = entry.get(field)
-            if ids is None and section == "themes":
+            if not ids and section == "themes":
                 ids = entry.get("evidence_ids")  # Same references, alternate field name.
             if isinstance(ids, str):
                 ids = re.split(r"[,;]", ids)
@@ -473,6 +484,11 @@ def validate_insights(raw, payload):
             if section == "themes":
                 result["cited_sample_answers"] = len(result[field])
             output[section].append(result)
+    if omitted_themes:
+        if not any(output[section] for section in ("interpretations","themes","recommendations")):
+            reason = " no written feedback was selected." if not feedback else " themes require valid written-feedback references."
+            raise InsightValidationError("AI supplied no usable findings;"+reason+" Retry the analysis. | AI 未提供可用結果；文字主題需有有效回覆依據，請重試分析。")
+        output["warnings"]=[f"{omitted_themes} AI feedback theme(s) were omitted because their format or response references could not be validated after correction. Other validated findings are shown. | 自動修正後仍有 {omitted_themes} 個 AI 文字主題格式或回覆依據不符，已略過；其餘通過檢查的結果仍會顯示。"]
     return output
 
 
@@ -501,6 +517,7 @@ def generate_insights(provider, key, payload, language):
         "Every item must cite the exact id strings supplied in the input. Do not renumber IDs when only some questions are selected. "
         "Column names, answer labels and response_number values are not evidence IDs. "
         "Interpretations/recommendations cite measured_findings IDs or feedback IDs. "
+        "Each theme MUST have a nonempty response_ids array containing exact feedback IDs. Omit a theme if you cannot cite supporting written responses. "
         "Themes cite only actual written feedback IDs, never measured-findings IDs. If feedback is empty, return themes: []. "
         "Use empty lists for sections without support. Do not invent responses, counts or percentages. "
         "Use supplied measured counts, denominators and percentages. Checkbox percentages use respondents answering that question and may exceed 100% in total. "
@@ -523,7 +540,7 @@ def generate_insights(provider, key, payload, language):
             ". If there are no written-feedback IDs, themes must be [].")
         repaired = generate_ai_text(provider, key, instruction,
             messages + [{"role": "assistant", "content": raw}, {"role": "user", "content": correction}], max_tokens=4096)
-        return validate_insights(repaired, payload)
+        return validate_insights(repaired, payload, omit_invalid_themes=True)
 
 
 def csv_bytes(rows):
@@ -599,6 +616,7 @@ def export_bundle(results, checks, metadata, insights=None, payload=None, compar
             plotly_included=True
     if insights:
         report["AI_interpretations_review_required"] = insights
+        parts.extend("<p>"+html.escape(warning)+"</p>" for warning in insights.get("warnings",[]))
         # Evidence needed to trace generated claims, with no raw feedback text.
         report["AI_scope"] = {"columns": sorted({r["column"] for r in payload["measured_findings"]}),
             "measured_evidence": payload["measured_findings"], "feedback_coverage": payload["feedback_coverage"],
@@ -608,7 +626,7 @@ def export_bundle(results, checks, metadata, insights=None, payload=None, compar
             parts.append("<article><h3>"+html.escape(entry.get("title") or "Key finding / 重點")+"</h3><p>"+html.escape(entry["text"])+"</p>")
             if entry.get("implication"):
                 parts.append("<p><b>Why it matters / 實務意義: </b>"+html.escape(entry["implication"])+"</p>")
-            parts.append("<details><summary>Supporting data / 支持資料</summary><p>"+"<br>".join(html.escape(s) for s in evidence_notes(payload,entry["evidence_ids"]))+"</p></details></article>")
+            parts.append("</article>")
         themes = theme_chart(insights)
         if themes:
             parts.append("<h2>Written feedback themes / 文字主題</h2><p>AI-coded supporting examples, not measured prevalence. Answers may support more than one theme.</p>")
@@ -620,7 +638,13 @@ def export_bundle(results, checks, metadata, insights=None, payload=None, compar
         parts.append(pd.DataFrame([{"Priority / 順序":i,"Action / 行動":e.get("title") or e["text"],
             "Recommendation / 建議":e["text"], "What to measure / 應追蹤指標":e.get("success_measure","")}
             for i,e in enumerate(insights["recommendations"],1)]).to_html(index=False,escape=True))
-        parts.append("<details><summary>Full evidence and sample coverage / 完整依據及樣本範圍</summary><pre>"+html.escape(json.dumps(report["AI_scope"],ensure_ascii=False,indent=2))+"</pre></details>")
+        parts.append("<details><summary>Supporting data / 支持資料</summary>")
+        for section,label in [("interpretations","AI insights / AI 洞察"),("themes","Written feedback themes / 文字意見主題"),("recommendations","Recommended next steps / 建議下一步")]:
+            if insights[section]:parts.append("<h3>"+label+"</h3>")
+            for entry in insights[section]:
+                refs=entry.get("evidence_ids",entry.get("response_ids",[]))
+                parts.append("<h4>"+html.escape(entry.get("title") or entry["text"])+"</h4><p>"+"<br>".join(html.escape(note) for note in evidence_notes(payload,refs))+"</p>")
+        parts.append("<h3>Sample coverage / 樣本範圍</h3><pre>"+html.escape(json.dumps(report["AI_scope"],ensure_ascii=False,indent=2))+"</pre></details>")
     parts.append("</body></html>")
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -640,7 +664,8 @@ def export_bundle(results, checks, metadata, insights=None, payload=None, compar
 def render_survey_analysis(provider, ai_key):
     st.header("Survey Results Analysis | 問卷結果分析")
     st.write("Upload survey results, review your columns and AI input, then analyze results and generate insights in one step. | 上傳問卷結果，檢查欄位與 AI 輸入後，一次完成結果分析及洞察產生。")
-    uploaded = st.file_uploader("Upload responses | 上傳回覆", type=["xls", "xlsx", "csv"], key="survey_results_file")
+    generation = st.session_state.get("module_reset_generations", {}).get("Survey Results Analysis | 問卷結果分析", 0)
+    uploaded = st.file_uploader("Upload responses | 上傳回覆", type=["xls", "xlsx", "csv"], key="survey_results_file_"+str(generation))
     if uploaded is None:
         return
     data, filename = uploaded.getvalue(), uploaded.name
@@ -741,16 +766,14 @@ def render_survey_analysis(provider, ai_key):
     ai_saved = ai_saved if ai_saved and ai_saved["signature"] == ai_signature else None
     if ai_saved:
         st.subheader("General AI insights | AI 整體洞察")
-        st.caption("AI interpretation: review the supporting data before acting. | AI 詮釋：採取行動前請核對支持資料。")
+        for warning in ai_saved["insights"].get("warnings",[]):st.warning(warning)
+        st.caption("AI interpretation: supporting data is grouped at the end for review before acting. | AI 詮釋：支持資料統一列於末尾，採取行動前請核對。")
         for i, entry in enumerate(ai_saved["insights"]["interpretations"],1):
             with st.container(border=True):
                 st.markdown("**"+prose(entry.get("title") or f"Key finding {i} / 重點 {i}")+"**")
                 st.markdown(prose(entry["text"]))
                 if entry.get("implication"):
                     st.markdown("**Why it matters / 實務意義：** "+prose(entry["implication"]))
-                with st.expander("Supporting data | 支持資料"):
-                    for note in evidence_notes(ai_saved["payload"],entry["evidence_ids"]):
-                        st.caption(prose(note))
         themes = theme_chart(ai_saved["insights"])
         if themes:
             st.subheader("Written feedback themes | 文字意見主題")
@@ -790,6 +813,13 @@ def render_survey_analysis(provider, ai_key):
             """, unsafe_allow_html=True)
             st.button("Use recommendations in Marketing Promotion | 將建議用於行銷推廣", key="survey_to_promotion",
                 type="primary", width="stretch", on_click=use_recommendations, args=(recommendation_brief(ai_saved,filename),))
+        with st.expander("Supporting data | 支持資料"):
+            for section,label in [("interpretations","AI insights / AI 洞察"),("themes","Written feedback themes / 文字意見主題"),("recommendations","Recommended next steps / 建議下一步")]:
+                if ai_saved["insights"][section]:st.markdown("**"+label+"**")
+                for entry in ai_saved["insights"][section]:
+                    st.markdown("**"+prose(entry.get("title") or entry["text"])+"**")
+                    for note in evidence_notes(ai_saved["payload"],entry.get("evidence_ids",entry.get("response_ids",[]))):
+                        st.caption(prose(note))
     st.subheader("Download analysis and charts | 下載分析與圖表")
     metadata = {"file": filename, "worksheet": sheet, "responses": len(frame), **notes,
         "method": "One nonblank row = one response; duplicate rows retained. Counts are unweighted, descriptive, not population estimates."}

@@ -3,12 +3,13 @@ import copy
 import hashlib
 import json
 import re
+from uuid import uuid4
 
 import mistune
 import streamlit as st
 from notion_client import Client
 
-from customer_service import children, generate_ai_text, rich, service_error_details
+from customer_service import children, generate_ai_text, rich, service_error_details, dated_notion_title
 
 PROMOTION_MODULE = "Marketing promotion | 行銷推廣"
 PLAN_WORKFLOW = "Survey action & promotion plan | 問卷行動與推廣計畫"
@@ -192,6 +193,8 @@ def plan_blocks(text):
 
 def _block_value(block):
     kind = block.get("type", "paragraph")
+    if kind=="image":
+        return kind,"".join(r.get("plain_text",r.get("text",{}).get("content","")) for r in block['image'].get('caption',[]))
     if kind=="table":
         table=block["table"]
         rows=[["".join(r.get("plain_text",r.get("text",{}).get("content","")) for r in cell)
@@ -225,13 +228,60 @@ def _saved_blocks(notion,page_id):
     return blocks
 
 
-def save_plan_to_notion(api_key, parent_id, title, text, source, progress=None):
+def upload_notion_png(notion,api_key,data,filename="chart.png"):
+    if len(data)>20*1024*1024:
+        raise ValueError("Image exceeds Notion's upload limit. | 圖片超過 Notion 上傳大小限制。")
+    upload=notion.file_uploads.create(mode="single_part",filename=filename,content_type="image/png")
+    sent=notion.file_uploads.send(file_upload_id=upload['id'],file=(filename,data,"image/png"))
+    if sent.get('status')!='uploaded':
+        raise ValueError("Notion image upload is incomplete. Retry saving. | Notion 圖片上傳未完成，請重試儲存。")
+    return upload['id']
+
+
+def chart_manifest(images):
+    return [{"caption":image['caption'],"after_heading":image['after_heading'],
+             "digest":hashlib.sha256(image['figure'].to_json().encode()).hexdigest()} for image in images]
+
+
+def chart_png(figure):
+    try:
+        data=figure.to_image(format='png',width=1400,height=int(figure.layout.height or 600),scale=1.5)
+    except Exception as error:
+        raise ValueError("Chart images could not be rendered. Install the latest requirements and Chrome/Chromium; on Streamlit Cloud deploy packages.txt too. No complete save was reported. | 無法產生圖表圖片；請安裝最新套件與 Chrome／Chromium，Streamlit Cloud 也需部署 packages.txt。尚未回報儲存完成。") from error
+    if len(data)>5*1024*1024:
+        raise ValueError("A chart image exceeds 5 MB; reduce the number of plotted categories before saving. | 圖表圖片超過 5 MB，請減少圖表類別後再儲存。")
+    return data
+
+
+def save_plan_to_notion(api_key, parent_id, title, text, source, progress=None, images=None):
     if not title.strip() or not text.strip():
         raise ValueError("A plan title and text are required. | 請填寫計畫標題及內容。")
-    reference = "MPL-"+digest({"format":PLAN_FORMAT_VERSION,"title":title.strip(),"text":text.strip(),"source":source})[:24]
-    marker = "Plan reference / 計畫編號: "+reference
-    content = plan_blocks(text)
+    images=images or []
+    manifest=chart_manifest(images)
+    if images:source={**source,'chart_images_v1':manifest}
+    identity={"format":PLAN_FORMAT_VERSION,"title":title.strip(),"text":text.strip(),"source":source}
+    explicit_run=progress is not None
+    reference = "MPL-"+digest(identity)[:24]
+    if explicit_run:reference+='-'+progress.setdefault('run_id',uuid4().hex)[:12]
     progress = {} if progress is None else progress
+    if 'page_title' not in progress:progress['page_title']=dated_notion_title(title)
+    page_title=progress['page_title']
+    is_report = bool(source.get("report_type"))
+    marker = ("Report reference / 報告編號: " if is_report else "Plan reference / 計畫編號: ")+reference
+    content = plan_blocks(text)
+    if images:
+        # Resolve placements before touching Notion; never silently omit requested charts.
+        placements={}
+        for index,image in enumerate(images):
+            matches=[i for i,block in enumerate(content) if block['type'].startswith('heading_') and _block_value(block)[1]==image['after_heading']]
+            if len(matches)!=1:raise ValueError("Chart placement heading is missing or repeated. | 圖表放置標題不存在或重複。")
+            placements.setdefault(matches[0],[]).append(index)
+        expanded=[]
+        for i,block in enumerate(content):
+            expanded.append(block)
+            for index in placements.get(i,[]):
+                expanded.append({'object':'block','type':'image','image':{'type':'file_upload','file_upload':{'id':'pending'},'caption':rich(images[index]['caption'])},'_chart_index':index})
+        content=expanded
     notion = Client(auth=api_key.strip())
     page_id, existing = None, []
     # The leading reference identifies a partially saved page. Old app versions
@@ -239,12 +289,17 @@ def save_plan_to_notion(api_key, parent_id, title, text, source, progress=None):
     for child in children(notion,parent_id):
         if child.get("type")!="child_page" or child.get("archived") or child.get("in_trash"):
             continue
-        if child.get("child_page",{}).get("title")!=title.strip():
+        child_title=child.get("child_page",{}).get("title","")
+        if child_title!=title.strip() and not child_title.startswith(title.strip()+' · '):
             continue
         blocks = _saved_blocks(notion,child["id"])
-        matches = [i for i,b in enumerate(blocks) if _block_value(b)==("paragraph",marker)]
+        matches = [i for i,b in enumerate(blocks) if _block_value(b)==("paragraph",marker)
+                   or (not explicit_run and _block_value(b)[0]=='paragraph' and _block_value(b)[1].startswith(marker+'-'))]
         if matches:
+            marker=_block_value(blocks[matches[0]])[1]
+            reference=marker.split(': ',1)[1]
             page_id, existing = child["id"], blocks
+            progress['page_title']=child_title
             progress["url"] = "https://www.notion.so/"+page_id.replace("-","")
             if matches[0]>0:
                 return {"id":page_id,"url":progress["url"]}
@@ -254,23 +309,90 @@ def save_plan_to_notion(api_key, parent_id, title, text, source, progress=None):
         {"object":"block","type":"paragraph","paragraph":{"rich_text":rich(
             str(source.get("survey","Survey recommendations"))+" · "+str(source.get("survey_response_count",0))+" responses / 筆回覆")}},
         {"object":"block","type":"paragraph","paragraph":{"rich_text":rich("Save complete / 儲存完成: "+reference)}}]
+    if is_report:
+        footer = [{"object":"block","type":"paragraph","paragraph":{"rich_text":rich("Save complete / 儲存完成: "+reference)}}]
     expected = [{"object":"block","type":"paragraph","paragraph":{"rich_text":rich(marker)}}]+content+footer
     if page_id:
         if len(existing)>len(expected) or [_block_value(b) for b in existing] != [_block_value(b) for b in expected[:len(existing)]]:
             raise ValueError("The partially saved Notion page was edited. Open it to review before retrying; it will not be overwritten. | 部分儲存的 Notion 頁面已被修改，請開啟檢查，應用程式不會覆寫。")
-    else:
+    # Render remaining charts before any page mutation. Resume skips already-attached images.
+    pending=expected[len(existing):] if page_id else expected
+    rendered={}
+    for block in pending:
+        if '_chart_index' in block:
+            index=block['_chart_index'];key=manifest[index]['digest']
+            if key not in rendered:rendered[key]=chart_png(images[index]['figure'])
+    uploaded_ids={}
+    def materialize(batch):
+        output=[]
+        for original in batch:
+            block=copy.deepcopy(original)
+            if '_chart_index' in block:
+                index=block.pop('_chart_index');key=manifest[index]['digest']
+                if key not in uploaded_ids:
+                    uploaded_ids[key]=upload_notion_png(notion,api_key,rendered[key],f'chart-{key[:12]}.png')
+                block['image']['file_upload']['id']=uploaded_ids[key]
+            output.append(block)
+        return output
+    if not page_id:
         first = next(_block_batches(expected))
         page = notion.pages.create(parent={"type":"page_id","page_id":parent_id},
-            properties={"title":{"type":"title","title":rich(title.strip())}}, children=first)
+            properties={"title":{"type":"title","title":rich(page_title)}}, children=materialize(first))
         page_id, existing = page["id"], first
         progress["url"] = page.get("url") or "https://www.notion.so/"+page_id.replace("-","")
     for batch in _block_batches(expected[len(existing):]):
-        notion.blocks.children.append(block_id=page_id,children=batch)
+        notion.blocks.children.append(block_id=page_id,children=materialize(batch))
     # Re-read on completion: an interrupted append may already have succeeded.
     stored = _saved_blocks(notion,page_id)
     if [_block_value(b) for b in stored] != [_block_value(b) for b in expected]:
         raise ValueError("Notion save is incomplete. Retry the same plan to resume saving. | Notion 尚未儲存完整，請使用相同計畫重試以繼續儲存。")
     return {"id":page_id,"url":progress["url"]}
+
+
+def report_table(rows, columns):
+    """Build Markdown that the shared Notion formatter turns into a native table."""
+    def cell(value):
+        if isinstance(value,float):
+            value = f"{value:,.0f}" if value.is_integer() else f"{value:,.2f}"
+        text = "—" if value is None else str(value)
+        text = re.sub(r"([\\`*_\[\]])", r"\\\1", text)
+        return text.replace("|", "\\|").replace("\n", " / ").replace("\r", " ")
+    return "\n".join(["| "+" | ".join(cell(c) for c in columns)+" |",
+                      "| "+" | ".join("---" for _ in columns)+" |"]+
+                     ["| "+" | ".join(cell(row.get(c)) for c in columns)+" |" for row in rows])
+
+
+def render_analysis_save(prefix, title, text, notion_key, page_link, parse_page_id,images=None):
+    """Shared analysis save action; uses sidebar credentials and resumable page saves."""
+    source = {"report_type":prefix}
+    images=images or []
+    if images:source['chart_images_v1']=chart_manifest(images)
+    parent = parse_page_id(page_link) if parse_page_id else ""
+    signature = digest({"format":PLAN_FORMAT_VERSION,"parent":parent,
+        "credential":hashlib.sha256(notion_key.encode()).hexdigest(),"title":title,"text":text,"source":source})
+    saved = st.session_state.get(prefix+"_notion_saved")
+    saved = saved if saved and saved["signature"]==signature else None
+    if st.button("Save results to Notion | 儲存結果至 Notion",key=prefix+"_notion_save",disabled=bool(saved),type="primary"):
+        if not notion_key.strip() or not re.fullmatch(r"[a-fA-F0-9]{32}",parent):
+            st.error("Enter your Notion key and parent page link in the sidebar. | 請在側欄填入 Notion 金鑰及上層頁面連結。")
+        else:
+            try:
+                progress_key=prefix+"_notion_progress"
+                if st.session_state.get(progress_key,{}).get("signature")!=signature:
+                    st.session_state[progress_key]={"signature":signature}
+                with st.spinner("Saving results to Notion… | 正在儲存結果至 Notion…"):
+                    result=save_plan_to_notion(notion_key,parent,title,text,source,st.session_state[progress_key],images=images)
+                saved={"signature":signature,"result":result}
+                st.session_state[prefix+"_notion_saved"]=saved
+            except Exception as error:
+                st.error("Save could not be confirmed. Retry to resume the same report. | 無法確認儲存結果，請重試以接續儲存同一份報告。")
+                st.code(json.dumps(service_error_details(error,"Notion","Save analysis results",notion_key),ensure_ascii=False,indent=2),language=None)
+    progress=st.session_state.get(prefix+"_notion_progress",{})
+    if not saved and progress.get("signature")==signature and progress.get("url"):
+        st.link_button("Open partially saved report | 開啟部分儲存的報告",progress["url"])
+    if saved:
+        st.success("Results saved to Notion. | 結果已儲存至 Notion。")
+        st.link_button("Open report in Notion | 在 Notion 開啟報告",saved["result"]["url"])
 
 
 def render_marketing_plan(provider, ai_key, notion_key, page_link, parse_page_id):
@@ -310,6 +432,7 @@ def render_marketing_plan(provider, ai_key, notion_key, page_link, parse_page_id
                 st.session_state.marketing_plan_generation = st.session_state.get("marketing_plan_generation",0)+1
                 st.session_state.marketing_plan_generated = {"signature":signature,"text":text}
                 st.session_state.pop("marketing_plan_saved",None)
+                st.session_state.pop("marketing_plan_save_progress",None)
             except Exception as error:
                 st.error("Plan generation failed. | 計畫產生失敗。")
                 st.code(json.dumps(service_error_details(error,provider,"auto",ai_key),ensure_ascii=False,indent=2),language=None)
@@ -333,7 +456,7 @@ def render_marketing_plan(provider, ai_key, notion_key, page_link, parse_page_id
     saved = st.session_state.get("marketing_plan_saved")
     saved = saved if saved and saved["signature"]==save_signature else None
     reviewed = st.checkbox("I reviewed this plan and want to save it to Notion. | 我已檢查此計畫，確認要儲存至 Notion。",key="marketing_plan_review_"+save_signature)
-    if st.button("Save plan to Notion | 儲存計畫至 Notion",key="marketing_plan_save",disabled=stale or not reviewed or not edited.strip() or bool(saved)):
+    if st.button("Save plan to Notion | 儲存計畫至 Notion",key="marketing_plan_save",disabled=stale or not reviewed or not edited.strip() or bool(saved),type="primary"):
         if not notion_key.strip() or not page_link.strip() or not re.fullmatch(r"[a-fA-F0-9]{32}",parse_page_id(page_link)):
             st.error("Enter a Notion key and valid parent page link in the sidebar. | 請在側欄輸入 Notion 金鑰及有效的上層頁面連結。")
         else:

@@ -12,11 +12,37 @@ from google import genai
 from anthropic import Anthropic
 from notion_client import Client
 from survey_analysis import render_survey_analysis
-from marketing_plan import render_marketing_plan, COPY_WORKFLOW, PLAN_WORKFLOW
-from customer_service import load_knowledge, service_reply, save_ticket, new_reference, DEFAULT_MODELS, test_service_connection, service_connection_error, service_error_details, cursor_reply, select_text_model
+from campaign_analysis import render_campaign_analysis
+from competitor_analysis import render_competitor_analysis
+from marketing_plan import render_marketing_plan, COPY_WORKFLOW, PLAN_WORKFLOW, digest
+from customer_service import load_knowledge, service_reply, save_ticket, new_reference, DEFAULT_MODELS, test_service_connection, service_connection_error, service_error_details, cursor_reply, select_text_model, dated_notion_title
+import hashlib
 
 
 IMAGE_MODELS = {"OpenAI": "gpt-image-1.5", "Gemini": "gemini-2.5-flash-image"}
+
+
+def reset_module_fields(module):
+    """Reset only the selected workspace; connection settings and other modules survive."""
+    prefixes = {
+        "Marketing promotion | 行銷推廣": ("copy_", "marketing_plan_"),
+        "Branding & image | 品牌與圖片": ("brand_",),
+        "Customer Service | 顧客服務": ("support_",),
+        "Survey Results Analysis | 問卷結果分析": ("survey_",),
+        "Campaign Performance Analysis | 行銷成效分析": ("campaign_",),
+        "Competitor Analysis | 競爭者分析": ("competitor_",),
+    }[module]
+    for key in list(st.session_state):
+        if key.startswith(prefixes) and key != "support_knowledge":
+            del st.session_state[key]
+    if module == "Marketing promotion | 行銷推廣":
+        st.session_state.pop("output", None)
+    # New upload widget identities also discard browser-held file selections.
+    generations = dict(st.session_state.get("module_reset_generations", {}))
+    generations[module] = generations.get(module, 0) + 1
+    st.session_state.module_reset_generations = generations
+    if module == "Customer Service | 顧客服務":
+        st.session_state.support_messages = []
 
 
 def generate_branding_image(provider, api_key, prompt, aspect_ratio):
@@ -563,6 +589,18 @@ def build_branding_image_prompt(
     return "\n".join(lines)
 
 
+def database_save_identity(prefix,notion,source_id,title_property,title,payload,api_key):
+    signature=digest([source_id,title_property,title,payload,hashlib.sha256(api_key.encode()).hexdigest()])
+    state_key=prefix+"_notion_identity"
+    identity=st.session_state.get(state_key)
+    if not identity or identity['signature']!=signature:
+        identity={'signature':signature,'title':dated_notion_title(title)}
+        st.session_state[state_key]=identity
+    existing=notion.data_sources.query(data_source_id=source_id,
+        filter={'property':title_property,'title':{'equals':identity['title']}},page_size=1).get('results',[])
+    return identity['title'],existing[0] if existing else None
+
+
 def save_branding_to_notion(
     notion_api_key,
     notion_database_id,
@@ -592,12 +630,17 @@ def save_branding_to_notion(
     source_id = prepare_notion_data_source(
         notion, notion_database_id, _branding_image_db_schema(cols)
     )
+    title,existing=database_save_identity('brand',notion,source_id,cols['product_name'],brand_product_name,
+        [ai_model,business_type,brand_name,brand_product_description,brand_visual_details,brand_colors,visual_style,
+         scene_vibe,mascot_or_theme,image_purpose,aspect_ratio,image_headline,image_subhead,overlay_language,
+         avoid_in_image,image_prompt,hashlib.sha256(image_data or b'').hexdigest()],notion_api_key)
+    if existing:return existing
     image_files = upload_notion_image(notion, notion_api_key, image_data) if image_data else []
-    notion.pages.create(
+    return notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": source_id},
         properties={
             cols["product_name"]: {
-                "title": [{"text": {"content": brand_product_name or ""}}]
+                "title": [{"text": {"content": title}}]
             },
             cols["business_type"]: {
                 "rich_text": notion_rich_text(business_type)
@@ -659,11 +702,14 @@ def save_to_notion(
     source_id = prepare_notion_data_source(
         notion, notion_database_id, _marketing_copy_db_schema(cols)
     )
-    notion.pages.create(
+    title,existing=database_save_identity('copy',notion,source_id,cols['product_name'],product_name,
+        [ai_model,product_description,promotion_type,target_audience,message_tone,time_frame,output],notion_api_key)
+    if existing:return existing
+    return notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": source_id},
         properties={
             cols["product_name"]: {
-                "title": [{"text": {"content": product_name or ""}}]
+                "title": [{"text": {"content": title}}]
             },
             cols["product_description"]: {
                 "rich_text": notion_rich_text(product_description)
@@ -886,8 +932,16 @@ with st.sidebar:
 
 selected_module = st.selectbox(
     "Choose a module | 選擇模組",
-    ["Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片", "Customer Service | 顧客服務", "Survey Results Analysis | 問卷結果分析"],
+    ["Survey Results Analysis | 問卷結果分析", "Competitor Analysis | 競爭者分析", "Marketing promotion | 行銷推廣", "Branding & image | 品牌與圖片", "Campaign Performance Analysis | 行銷成效分析", "Customer Service | 顧客服務"],
     key="selected_module",
+)
+
+st.button(
+    "Refresh results / Reset fields | 重設欄位與結果",
+    key="reset_current_module",
+    on_click=reset_module_fields,
+    args=(selected_module,),
+    help="Restore this module's default fields and clear its results. Sidebar settings and other modules are kept. | 將此模組欄位恢復預設並清除結果；保留側欄設定及其他模組。",
 )
 
 if selected_module == "Marketing promotion | 行銷推廣":
@@ -985,6 +1039,7 @@ if selected_module == "Marketing promotion | 行銷推廣":
                         else:
                             st.session_state.output = generate_with_cursor(ai_api_key, prompt)
 
+                        st.session_state.pop("copy_notion_identity",None)
                         st.success("Marketing content generated! | 行銷內容已產生！")
 
                     except Exception as e:
@@ -1011,7 +1066,7 @@ if selected_module == "Marketing promotion | 行銷推廣":
             st.subheader("Raw JSON")
             st.json(output)
 
-            if st.button("Save Output to Notion | 儲存到 Notion", key="btn_save_copy"):
+            if st.button("Save Output to Notion | 儲存到 Notion", key="btn_save_copy",type="primary"):
                 if not notion_api_key:
                     st.error(
                         "Enter your Notion API key in the sidebar. | "
@@ -1248,6 +1303,7 @@ elif selected_module == "Branding & image | 品牌與圖片":
                         "data": data, "prompt": current_image_prompt,
                         "provider": ai_provider, "model": IMAGE_MODELS[ai_provider],
                     }
+                    st.session_state.pop("brand_notion_identity",None)
                     st.success("Image generated! | 圖片已產生！")
                 except Exception as e:
                     st.error("Image generation failed. Check your API key, model access, and billing, then retry. | 圖片產生失敗，請檢查金鑰、模型權限與帳務後重試。")
@@ -1262,7 +1318,7 @@ elif selected_module == "Branding & image | 品牌與圖片":
         if not matching_image:
             st.info("Your inputs have changed. Generate a new image before saving it with this brief. | 輸入已變更，請重新產生圖片後再與此品牌資訊一起儲存。")
 
-    if st.button("Save to Notion | 儲存到 Notion", key="btn_save_brand"):
+    if st.button("Save to Notion | 儲存到 Notion", key="btn_save_brand",type="primary"):
         missing = []
         if not business_type.strip():
             missing.append("Business type | 業態類型")
@@ -1407,7 +1463,7 @@ elif selected_module == "Customer Service | 顧客服務":
     for message in st.session_state.support_messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
-    message = st.chat_input("Ask about this business | 詢問商家資訊", disabled=not knowledge or not service_key.strip())
+    message = st.chat_input("Ask about this business | 詢問商家資訊", disabled=not knowledge or not service_key.strip(), key="support_chat_input")
     if message:
         if len(message) > 4000 or sum(len(m["content"]) for m in st.session_state.support_messages) + len(message) > 40000:
             st.warning("Conversation is too long. Shorten your message or start a new conversation. | 對話過長，請縮短訊息或開始新對話。")
@@ -1445,8 +1501,8 @@ elif selected_module == "Customer Service | 顧客服務":
             contact = st.text_input("Contact (optional) | 聯絡方式（選填）", key="support_field_contact", max_chars=500)
             category = st.text_input("Category | 類別", key="support_field_category", max_chars=200)
             summary = st.text_area("Issue summary | 問題摘要", key="support_field_summary", max_chars=5000)
-            include_history = st.checkbox("Include conversation in ticket | 工單附上對話紀錄")
-            confirmed = st.form_submit_button("Confirm and create support ticket | 確認並建立客服工單")
+            include_history = st.checkbox("Include conversation in ticket | 工單附上對話紀錄", key="support_include_history")
+            confirmed = st.form_submit_button("Confirm and create support ticket | 確認並建立客服工單",type="primary")
         if confirmed:
             if not subject.strip() or not summary.strip() or not notion_api_key.strip() or not notion_parent_page_id.strip():
                 st.error("Subject, summary, Notion key and business page link are required. | 請填寫主旨、摘要、Notion 金鑰與商家頁面連結。")
@@ -1468,3 +1524,7 @@ elif selected_module == "Customer Service | 顧客服務":
 
 elif selected_module == "Survey Results Analysis | 問卷結果分析":
     render_survey_analysis(ai_provider, ai_api_key)
+elif selected_module == "Campaign Performance Analysis | 行銷成效分析":
+    render_campaign_analysis(ai_provider, ai_api_key, notion_api_key, notion_parent_page_id, parse_notion_id)
+elif selected_module == "Competitor Analysis | 競爭者分析":
+    render_competitor_analysis(ai_provider, ai_api_key, notion_api_key, notion_parent_page_id, parse_notion_id)
